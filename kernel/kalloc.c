@@ -23,11 +23,50 @@ struct {
   struct run *freelist;
 } kmem;
 
+// 32768 pages of physical memory to keep track of
+#define PRCSIZE ((PHYSTOP - KERNBASE) / PGSIZE)
+
+// a uint8 is enough, since the maximum number of processes
+// that can run simultaneously is 64 (NPROC). This means that
+// the table is 32768 bytes (32KB) long.
+struct {
+  struct spinlock lock;
+  uint8 table[PRCSIZE];
+} prc;
+
+// uint16 is enough, since __UINT16_MAX__ is 65535
+#define PRCIDX(pa) ((uint16)((pa - KERNBASE) / PGSIZE))
+
+void
+prcinc(uint64 pa)
+{
+  acquire(&prc.lock);
+  prc.table[PRCIDX(pa)]++;
+  release(&prc.lock);
+}
+
+uint8
+prccnt(uint64 pa)
+{
+  uint8 cnt;
+
+  acquire(&prc.lock);
+  cnt = prc.table[PRCIDX(pa)];
+  release(&prc.lock);
+
+  return cnt;
+}
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&prc.lock, "prc");
   freerange(end, (void*)PHYSTOP);
+  acquire(&prc.lock);
+  for(uint16 i = 0; i < PRCSIZE; i++)
+    prc.table[i] = 0;
+  release(&prc.lock);
 }
 
 void
@@ -50,6 +89,15 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  acquire(&prc.lock);
+  if(prc.table[PRCIDX((uint64)pa)] > 1){
+    prc.table[PRCIDX((uint64)pa)]--;
+    release(&prc.lock);
+    return;
+  }
+  prc.table[PRCIDX((uint64)pa)] = 0;
+  release(&prc.lock);
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -76,7 +124,12 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
+    acquire(&prc.lock);
+    prc.table[PRCIDX((uint64)r)] = 1;
+    release(&prc.lock);
     memset((char*)r, 5, PGSIZE); // fill with junk
+  }
+    
   return (void*)r;
 }

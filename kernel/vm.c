@@ -291,19 +291,17 @@ uvmfree(pagetable_t pagetable, uint64 sz)
   freewalk(pagetable);
 }
 
-// Given a parent process's page table, copy
-// its memory into a child's page table.
-// Copies both the page table and the
-// physical memory.
+// Given a parent process' page table, create
+// new ptes for the child's page table
+// that point to the same memory, and remove
+// PTE_W from both processes' ptes.
 // returns 0 on success, -1 on failure.
-// frees any allocated pages on failure.
+// unmaps any newly-mapped pages on failure.
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
-  uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -311,20 +309,55 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    if(mappages(new, i, PGSIZE, pa, PTE_FLAGS(*pte) & (~PTE_W)) != 0)
       goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
-    }
+    prcinc(pa);
+    *pte &= (~PTE_W);
   }
   return 0;
 
  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
+}
+
+// Given a process' page table and a cow page that
+// needs to be written to, create a new page, copy 
+// the old page to the new one, replace the pte
+// with the new page, kfree the old page and mark
+// the new page as writtable.
+// returns 0 on success, -1 on failure.
+int 
+uvmcow(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 oldpa, newpa;
+
+  if(va >= MAXVA)
+    return -1;
+
+  pte = walk(pagetable, va, 0);
+  
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_V) == 0)
+    return -1;
+  if((*pte & PTE_U) == 0)
+    return -1;
+
+  oldpa = PTE2PA(*pte);
+
+  if(prccnt(oldpa) == 1){
+    *pte |= PTE_W;
+    return 0;
+  }
+
+  if((newpa = (uint64)kalloc()) == 0)
+    return -1;
+  memmove((void *)newpa, (void *)oldpa, PGSIZE);
+  *pte = PA2PTE(newpa) | PTE_FLAGS(*pte) | PTE_W;
+  kfree((void *)oldpa);
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -350,6 +383,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if(uvmcow(pagetable, va0) < 0)
+	    return -1;
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
